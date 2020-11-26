@@ -49,7 +49,7 @@ class Player {
             }
         }
         
-        Univers.opponent.possibleStart.addAll(Univers.MAP_AS_LIST.stream().filter(Cell::isNaviguable).collect(Collectors.toList()));
+        Univers.opponent.addToPossibleStart(Univers.MAP_AS_LIST.stream().filter(Cell::isNaviguable).collect(Collectors.toList()));
         
         
         // Write an action using System.out.println()
@@ -78,6 +78,7 @@ class Player {
                 in.nextLine();
             }
             String opponentOrders = in.nextLine();
+            Univers.opponent.includeSonarResult(sonarResult);
             
             Univers.myself.setPosition(x,y);
             Univers.myself.updateCooldown(torpedoCooldown, sonarCooldown, silenceCooldown, mineCooldown);
@@ -93,13 +94,32 @@ class Player {
                 Univers.actionManager.addAction(new SurfaceAction());
                 Univers.myself.onSurface();
             } else {
-                Univers.actionManager.addAction(new MoveAction(direction, MoveSort.TORPEDO));
+                if(Univers.opponent.startIsKnown()) {
+                    Univers.actionManager.addAction(new MoveAction(direction, MoveSort.TORPEDO));
+                } else {
+                    Univers.actionManager.addAction(new MoveAction(direction, MoveSort.SONAR));
+                }
             }
             if(Univers.myself.isTopedoAvailable()){
                 Cell torpedoCell = Univers.myself.torpedoAccessible().get(0);
                 if(Univers.opponent.startIsKnown()) {
                     Univers.actionManager.addAction(new TorpedoAction(Univers.opponent.getPosX(), Univers.opponent.getPosY()));
                 }
+            }
+            if(Univers.myself.isSonarAvailable() && !Univers.opponent.startIsKnown()) {
+                Map<Integer, Integer> sectorPossiblePosition = new HashMap<>();
+                for(Cell possible : Univers.opponent.possibleStart.values().stream().flatMap(Collection::stream).collect(Collectors.toList())) {
+                    sectorPossiblePosition.put(possible.getSector(), sectorPossiblePosition.getOrDefault(possible.getSector(), 0)+1);
+                }
+                int bestSector = 0;
+                int maxValue = Integer.MIN_VALUE;
+                for(Map.Entry<Integer, Integer> sectorCount : sectorPossiblePosition.entrySet()) {
+                    if(maxValue < sectorCount.getValue()) {
+                        maxValue = sectorCount.getValue();
+                        bestSector = sectorCount.getKey();
+                    }
+                }
+                Univers.actionManager.addAction(new SonarAction(bestSector));
             }
             Univers.actionManager.sendAction();
         }
@@ -221,27 +241,92 @@ class Submarine {
 
 class OpponentSubmarine extends Submarine {
     public List<Action> actions = new ArrayList<>();
+    private List<Action> actionsThisTurn;
     
     //Contains the delta position from start
-    public List<Cell> possibleStart = new ArrayList<>();
+    //public List<Cell> possibleStart = new ArrayList<>();
+    public Map<Cell, List<Cell>> possibleStart = new HashMap<>();
     public Cell startCell = null;
     
     public int dx, dy;
     
     
     public void addAction(String opponentOrders) {
-        List<Action> actions = Univers.actionManager.fromStringToActions(opponentOrders);
-        
-        for(Action action : actions) {
-            this.actions.add(action);
+        this.actionsThisTurn = Univers.actionManager.fromStringToActions(opponentOrders);
+        this.actions.addAll(this.actionsThisTurn);
+        for(Action action : this.actionsThisTurn) {
             if(action instanceof MoveAction) {
                 MoveAction action1 = (MoveAction) action;
                 this.dx += action1.direction.dx;
                 this.dy += action1.direction.dy;
+                
+            }
+            if(action instanceof SilenceAction) {
+                if(Univers.DEBUG) {
+                    System.err.println("Opponent SILENCE and Start is " + (this.startIsKnown()? "know": "not know"));
+                }
+                if(this.startIsKnown()) {
+                    this.possibleStart.clear();
+                    //Silence can move from 1 to 4 case in all direction
+                    for (MoveDirection direction : MoveDirection.values()) {
+                        for (int i = 1; i < 4; i++) {
+                            Cell nextCell = this.getCurrentCell();
+                            for (int j = 0; j < i; j++) {
+                                nextCell = nextCell.getCellAtDirection(direction);
+                                if (nextCell == null || !nextCell.isNaviguable() || this.visitedSinceLastSurface.contains(nextCell)) {
+                                    nextCell = null;
+                                    break;
+                                }
+                            }
+                            if (nextCell != null) {
+                                List<Cell> possible = this.possibleStart.getOrDefault(this.getCurrentCell(), new ArrayList<>());
+                                possible.add(nextCell);
+                                this.possibleStart.put(this.getCurrentCell(), possible);
+                            }
+                        }
+                    }
+                } else {
+                    for(Map.Entry<Cell, List<Cell>> entry : this.possibleStart.entrySet()) {
+                        //For all possible end, need to add all element from Silence
+                        List<Cell> newPossibleEnd = new ArrayList<>();
+                        List<Cell> toRemove = new ArrayList<>();
+                        for(Cell possibleCurrent : entry.getValue()) {
+                            for (MoveDirection direction : MoveDirection.values()) {
+                                for (int i = 1; i < 4; i++) {
+                                    Cell nextCell = possibleCurrent;
+                                    for (int j = 0; j < i; j++) {
+                                        nextCell = nextCell.getCellAtDirection(direction);
+                                        if (nextCell == null || !nextCell.isNaviguable() || this.visitedSinceLastSurface.contains(nextCell)) {
+                                            nextCell = null;
+                                            break;
+                                        }
+                                    }
+                                    if (nextCell != null) {
+                                        newPossibleEnd.add(nextCell);
+                                        toRemove.add(possibleCurrent);
+                                    }
+                                }
+                            }
+                        }
+                        entry.getValue().removeAll(toRemove);
+                        entry.getValue().addAll(newPossibleEnd);
+                    }
+                }
+                this.startCell = null;
+                this.dx = 0;
+                this.dy = 0;
             }
         }
         
         this.tryToFindStart();
+    }
+    
+    private Cell getCurrentCell() {
+        try {
+            return Univers.MAP[this.getPosX()][this.getPosY()];
+        } catch (Exception ignored) {
+            return null;
+        }
     }
     
     private void tryToFindStart() {
@@ -249,47 +334,72 @@ class OpponentSubmarine extends Submarine {
             return;
         
         //Need to find the start position
-        List<Cell> impossibleCell = new ArrayList<>();
-        
-        for(Cell depart:this.possibleStart) {
+        List<Cell> impossibleStarts = new ArrayList<>();
+        for(Map.Entry<Cell, List<Cell>> depart:this.possibleStart.entrySet()) {
+            List<Cell> impossibleCell = new ArrayList<>(Univers.BUFFER);
+            List<Cell> newCells = new ArrayList<>(Univers.BUFFER);
             //For all case, need to find if the succession of action is possible or not.
-            Cell current = depart;
-            for(Action action : this.actions) {
-                if(action instanceof MoveAction) {
-                    //Need to check if the next case if naviguable or not.
-                    MoveAction moveAction = (MoveAction) action;
-                    Cell nextCell = current.getCellAtDirection(moveAction.direction);
-                    if(nextCell == null || !nextCell.isNaviguable()) {
-                        impossibleCell.add(depart);
-                        break;
-                    }
-                    else current = nextCell;
-                    
-                } else if(action instanceof TorpedoAction) {
-                    //need to check if the torpedo can access the target
-                    TorpedoAction torpedoAction = (TorpedoAction) action;
-                    Cell touchTorpedo = Univers.MAP[torpedoAction.x][torpedoAction.y];
-                    if(current.distToCell(touchTorpedo) > 4.0d) {
-                        impossibleCell.add(depart);
-                        break;
-                    }
-                } else if(action instanceof SurfaceAction) {
-                    //Need to check the sector
-                    SurfaceAction surfaceAction = (SurfaceAction) action;
-                    if(current.getSector() != surfaceAction.sector) {
-                        impossibleCell.add(depart);
-                        break;
+            for(Cell current:depart.getValue()) {
+                for (Action action : this.actionsThisTurn) {
+                    if (action instanceof MoveAction) {
+                        //Need to check if the next case if naviguable or not.
+                        MoveAction moveAction = (MoveAction) action;
+                        Cell nextCell = current.getCellAtDirection(moveAction.direction);
+                        if (nextCell == null || !nextCell.isNaviguable()) {
+                            impossibleCell.add(current);
+                            break;
+                        } else {
+                            impossibleCell.add(current);            //Retrait de l'ancienne cellule de fin
+                            newCells.add(nextCell);
+                        }
+                    } else if (action instanceof TorpedoAction) {
+                        //need to check if the torpedo can access the target
+                        TorpedoAction torpedoAction = (TorpedoAction) action;
+                        Cell touchTorpedo = Univers.MAP[torpedoAction.x][torpedoAction.y];
+                        if (current.distToCell(touchTorpedo) > 4.0d) {
+                            impossibleCell.add(current);
+                            break;
+                        }
+                    } else if (action instanceof SurfaceAction) {
+                        //Need to check the sector
+                        SurfaceAction surfaceAction = (SurfaceAction) action;
+                        if (current.getSector() != surfaceAction.sector) {
+                            impossibleCell.add(current);
+                            break;
+                        }
+                    } else if (action instanceof SilenceAction) {
+                        impossibleCell.add(current);    //Retrait de l'ancienne cellule de fin
+                        for(MoveDirection direction: MoveDirection.values()) {
+                            Cell nextCell = current.getCellAtDirection(direction);
+                            if(nextCell != null && nextCell.isNaviguable())
+                                newCells.add(nextCell);
+                        }
                     }
                 }
             }
+            depart.getValue().removeAll(impossibleCell);
+            depart.getValue().addAll(newCells);
+            if(depart.getValue().isEmpty()) {
+                impossibleStarts.add(depart.getKey());
+            }
         }
         
-        this.possibleStart.removeAll(impossibleCell);
+        for(Cell impossibleStart : impossibleStarts) {
+            this.possibleStart.remove(impossibleStart);
+        }
         
         if(this.possibleStart.size() == 1) {
-            this.startCell = this.possibleStart.get(0);
-            if(Univers.INFO){
-                System.err.println("Start position found at: " + this.startCell);
+            Cell possibleStart = this.possibleStart.keySet().stream().findFirst().get();
+            if(this.possibleStart.get(possibleStart).size() == 1) {
+                this.startCell = possibleStart;
+                if(Univers.INFO){
+                    System.err.println("Start position found at: " + this.startCell);
+                }
+            }
+            else {
+                if(Univers.INFO) {
+                    System.err.println("One start point but multiple end");
+                }
             }
         } else {
             if(Univers.INFO) {
@@ -323,6 +433,56 @@ class OpponentSubmarine extends Submarine {
             else
                 System.err.println("Started at: " + this.startCell);
             System.err.println("DeltaPos since start: " + this.dx + " " + this.dy);
+        }
+    }
+    
+    /**
+     * Initialize the possible start HashMap
+     * @param possibleStart
+     */
+    public void addToPossibleStart(List<Cell> possibleStart) {
+        possibleStart.forEach(cell -> {this.possibleStart.put(cell, new ArrayList<>()); this.possibleStart.get(cell).add(cell);});
+    }
+    
+    
+    /**
+     *
+     * @param sonarResult
+     */
+    public void includeSonarResult(String sonarResult) {
+        if(MoveSort.NA.action.equals(sonarResult))
+            return;
+        
+        int sonarSector = Univers.actionManager.lastSonarAction().sector;
+        List<Cell> toRemove = new ArrayList<>(Univers.BUFFER);
+        List<Cell> toRemoveKey = new ArrayList<>(Univers.BUFFER);
+        if("Y".equals(sonarResult)) {   // Opponent is in the sonar Sector
+            //Remove all possible end where is not in this sector
+            for(Map.Entry<Cell, List<Cell>> entry : this.possibleStart.entrySet()) {
+                for(Cell possibleEnd : entry.getValue()) {
+                    if(possibleEnd.getSector() != sonarSector)
+                        toRemove.add(possibleEnd);
+                }
+                entry.getValue().removeAll(toRemove);
+                if(entry.getValue().isEmpty()) {
+                    toRemoveKey.add(entry.getKey());
+                }
+            }
+            toRemoveKey.forEach(key -> this.possibleStart.remove(key));
+            
+        } else {    //Opponent is not in the sonar Sector
+            //Remove all sector wich is in the sector
+            for(Map.Entry<Cell, List<Cell>> entry : this.possibleStart.entrySet()) {
+                for(Cell possibleEnd : entry.getValue()) {
+                    if(possibleEnd.getSector() == sonarSector)
+                        toRemove.add(possibleEnd);
+                }
+                entry.getValue().removeAll(toRemove);
+                if(entry.getValue().isEmpty()) {
+                    toRemoveKey.add(entry.getKey());
+                }
+            }
+            toRemoveKey.forEach(key -> this.possibleStart.remove(key));
         }
     }
 }
@@ -444,7 +604,7 @@ enum MoveSort {
 
 class ActionManager {
     private static final String ACTION_SEPARATOR = "|";
-    
+    List<Action> actionLastTurn = new ArrayList<>(Univers.BUFFER);
     List<Action> actionThisTurn = new ArrayList<>(Univers.BUFFER);
     
     public void addAction(Action action) {
@@ -460,6 +620,7 @@ class ActionManager {
             builder.append(action);
         }
         
+        this.actionLastTurn = new ArrayList<>(this.actionThisTurn);
         this.actionThisTurn.clear();
         Timer.printElapsed();
         System.out.println(builder.toString());
@@ -484,9 +645,18 @@ class ActionManager {
             if(MoveSort.MINE.action.equals(actionElement[0]))
                 ret.add(new TorpedoAction(Integer.parseInt(actionElement[1]), Integer.parseInt(actionElement[2])));
             if(MoveSort.SILENCE.action.equals(actionElement[0]))
-                ret.add(new SilenceAction());
+                    ret.add(new SilenceAction());
         }
         return ret;
+    }
+    
+    public SonarAction lastSonarAction() {
+        Action ret = null;
+        for(Action action : this.actionLastTurn) {
+            if(action instanceof SonarAction)
+                return (SonarAction) action;
+        }
+        return null;
     }
     
 }
@@ -507,11 +677,6 @@ class MoveAction extends Action {
     
     public MoveAction(MoveDirection direction) {
         this.direction = direction;
-    }
-    
-    public MoveAction(int parseInt, int parseInt1) {
-        super();
-        
     }
     
     @Override
@@ -557,10 +722,35 @@ class SurfaceAction extends Action {
 }
 
 class SilenceAction extends Action {
+    MoveDirection direction;
+    int nbCase = -1;
+    
+    public SilenceAction(MoveDirection direction, int nbCase) {
+        this.direction = direction;
+        this.nbCase = nbCase;
+    }
+    
+    public SilenceAction() {
+    
+    }
     
     @Override
     public String toString() {
-        return "SILENCE";
+        return "SILENCE " + direction.action + " " + this.nbCase;
+    }
+}
+
+class SonarAction extends Action {
+    
+    int sector;
+    
+    public SonarAction(int sector) {
+        this.sector = sector;
+    }
+    
+    @Override
+    public String toString() {
+        return "SONAR " + this.sector;
     }
 }
 
